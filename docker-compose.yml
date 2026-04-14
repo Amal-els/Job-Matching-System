@@ -1,0 +1,20 @@
+services:
+  db:
+    image: ankane/pgvector
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: careermate
+    ports:
+      - "5434:5432"
+
+  ai-service:
+    build: ./ai-service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ai-service:/app
+    env_file:
+      - .env
+    depends_on:
+      - db

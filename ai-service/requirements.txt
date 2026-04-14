@@ -1,0 +1,13 @@
+pydantic
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+numpy
+python-dotenv
+pgvector
+requests
+openai
+dotenv
+requests
+huggingface_hub
