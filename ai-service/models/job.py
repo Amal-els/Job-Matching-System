@@ -18,4 +18,6 @@ class Job(Base):
     source = Column(String)
     posted_at = Column(String)
     url = Column(String)
+    # Precomputed at ingest/save time; same space as match-time `vector` on job dicts.
+    embedding = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -8,7 +8,7 @@ router = APIRouter()
 
 
 @router.post("/")
-def match_jobs(payload: dict, db: Session = Depends(get_db)):
+async def match_jobs(payload: dict, db: Session = Depends(get_db)):
     profile = payload.get("user") or payload.get("profile")
     if not profile:
         raise HTTPException(status_code=400, detail="Provide a `user` or `profile` object.")
@@ -17,7 +17,7 @@ def match_jobs(payload: dict, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="`target_position` is required in the user profile.")
 
     try:
-        return run_matching_pipeline(
+        return await run_matching_pipeline(
             profile=profile,
             db=db,
             jobs=payload.get("jobs"),
