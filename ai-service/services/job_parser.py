@@ -166,7 +166,7 @@ Job description:
     return _normalize_llm_metadata(payload)
 
 
-def extract_job_metadata(title, description):
+def extract_job_metadata(title, description, allow_llm=True):
     text = normalize_text(title or "", description or "")
     heuristic = {
         "skills_required": extract_skills_heuristic(text),
@@ -174,7 +174,7 @@ def extract_job_metadata(title, description):
         "industry": extract_industry_heuristic(text),
     }
 
-    should_use_llm = is_enabled("USE_LLM_JOB_METADATA", "true")
+    should_use_llm = allow_llm and is_enabled("USE_LLM_JOB_METADATA", "true")
     if should_use_llm and get_llm_client():
         try:
             llm_metadata = extract_job_metadata_llm(title, description)

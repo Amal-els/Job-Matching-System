@@ -1,16 +1,19 @@
 
 from fastapi import FastAPI, Depends
 from sqlalchemy.orm import Session
-from routes.match import router
+from routes.match import router as match_router
+from routes.profile import router as profile_router
 from database import Base, engine
 from models.job import Job
+from models.profile import Profile
 from deps import get_db
 
 app = FastAPI()
 
 Base.metadata.create_all(bind=engine)
 
-app.include_router(router, prefix="/match")
+app.include_router(match_router, prefix="/match")
+app.include_router(profile_router, prefix="/profiles")
 
 @app.get("/")
 def health():

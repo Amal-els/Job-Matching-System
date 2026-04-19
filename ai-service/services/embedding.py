@@ -68,14 +68,34 @@ def embed(text: str) -> list:
 
 def embed_many(texts: list) -> list:
     """
-    Generate embeddings for multiple texts using Hugging Face Inference API.
+    Generate embeddings for multiple texts using Hugging Face Inference API in a single batch.
     Falls back to deterministic local embeddings if the API is unavailable.
     """
+    if not texts:
+        return []
+
     try:
         client = _get_client()
         model = _model_name()
-        # The inference API can handle lists, but let's ensure consistency with local pooling
-        return [_pool(client.feature_extraction(t or "", model=model)) for t in texts]
+        
+        # The Inference API feature_extraction supports lists of strings
+        # and returns a numpy array or list of embeddings.
+        results = client.feature_extraction(texts, model=model)
+        
+        # Ensure results are pooled if they are token-level (ndim == 3 for batch)
+        # or just converted to list if already pooled (ndim == 2 for batch)
+        if isinstance(results, np.ndarray):
+            if results.ndim == 3:  # (batch, tokens, dim)
+                return [res.mean(axis=0).tolist() for res in results]
+            return results.tolist()
+        
+        # If it's a list, check if items are themselves lists (pooled) or nested lists (tokens)
+        if isinstance(results, list):
+            if results and isinstance(results[0], list) and isinstance(results[0][0], list):
+                return [_pool(res) for res in results]
+            return results
+            
+        return [_pool(res) for res in results]
     except Exception as exc:
         logger.warning("Remote batch embedding unavailable, using local fallback: %s", exc)
         return [_embed_local(t or "") for t in texts]

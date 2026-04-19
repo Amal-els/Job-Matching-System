@@ -13,9 +13,15 @@ def _fallback_rerank_jobs(jobs, limit=10):
         keyword_score = float(job.get("keyword_score", 0.0))
         recency_score = float(job.get("recency_score", 0.0))
         proximity_score = float(job.get("proximity_score", 0.0))
+        semantic_weight = 0.45
+        keyword_weight = 0.30
+        if job.get("semantic_source") == "keyword_proxy":
+            semantic_weight = 0.25
+            keyword_weight = 0.50
+
         final_score = (
-            (0.45 * semantic_score)
-            + (0.30 * keyword_score)
+            (semantic_weight * semantic_score)
+            + (keyword_weight * keyword_score)
             + (0.15 * recency_score)
             + (0.10 * proximity_score)
         )
@@ -179,8 +185,8 @@ Input:
 logger = logging.getLogger(__name__)
 
 
-def rerank_jobs(profile, jobs, limit=10):
-    should_use_llm = is_enabled("USE_LLM_RERANKER", "true")
+def rerank_jobs(profile, jobs, limit=10, allow_llm=True):
+    should_use_llm = allow_llm and is_enabled("USE_LLM_RERANKER", "true")
     if should_use_llm and get_llm_client():
         try:
             llm_ranked = _llm_rerank_jobs(profile, jobs, limit=limit)

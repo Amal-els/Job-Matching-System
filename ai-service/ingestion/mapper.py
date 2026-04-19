@@ -1,11 +1,11 @@
 from services.job_parser import extract_job_metadata
 
 
-def map_adzuna_job(job):
+def map_adzuna_job(job, allow_llm=True):
     title = job.get("title") or ""
     description = job.get("description") or ""
     location = job.get("location", {}).get("display_name") or ""
-    metadata = extract_job_metadata(title, description)
+    metadata = extract_job_metadata(title, description, allow_llm=allow_llm)
 
     return {
         "id": f"adzuna_{job['id']}",
