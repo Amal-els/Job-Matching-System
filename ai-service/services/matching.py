@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from time import perf_counter
 
 from database import SessionLocal
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, func
 from models.job import Job
 from ingestion.adzuna import fetch_adzuna_jobs
 from ingestion.mapper import map_adzuna_job
@@ -187,6 +187,7 @@ def save_jobs_to_db(db, jobs, allow_llm_metadata=True):
         mark_ann_index_dirty()
     except Exception:
         db.rollback()
+        logger.exception("Failed to commit %s jobs to the database.", len(to_insert))
 
 
 def cleanup_stale_jobs(db):
@@ -220,6 +221,14 @@ def fetch_jobs_from_db(db, query, limit=50):
     return [job_to_dict(job) for job in db_jobs]
 
 
+def _fetch_jobs_from_db_with_fresh_session(query, limit=50):
+    db = SessionLocal()
+    try:
+        return fetch_jobs_from_db(db, query, limit)
+    finally:
+        db.close()
+
+
 def fetch_jobs_from_adzuna(query, country="fr", limit=50, location=None):
     return fetch_adzuna_jobs(country=country, query=query, limit=limit, location=location)
 
@@ -237,8 +246,9 @@ async def fetch_jobs_hybrid_async(db, query, country="fr", limit=50, location=No
 
     db_started = perf_counter()
     try:
-        db_jobs = await asyncio.to_thread(fetch_jobs_from_db, db, query, limit)
+        db_jobs = await asyncio.to_thread(_fetch_jobs_from_db_with_fresh_session, query, limit)
     except Exception:
+        logger.exception("DB keyword fetch failed for query '%s'.", query)
         db_jobs = []
     db_elapsed = int((perf_counter() - db_started) * 1000)
     results = list(db_jobs[:limit])
@@ -251,6 +261,7 @@ async def fetch_jobs_hybrid_async(db, query, country="fr", limit=50, location=No
         try:
             api_jobs = await asyncio.to_thread(fetch_jobs_from_adzuna, query, country, remaining, location)
         except Exception:
+            logger.exception("External Adzuna fetch failed for query '%s'.", query)
             api_jobs = []
         external_elapsed = int((perf_counter() - external_started) * 1000)
 
@@ -588,9 +599,6 @@ async def retrieve_candidates(profile, db=None, jobs=None, country="fr", fetch_l
     if jobs is not None:
         raw_jobs = jobs[:fetch_limit]
         source_counts = {"db": 0, "external": len(raw_jobs), "db_ms": 0, "external_ms": 0}
-    elif len(ann_jobs) >= keyword_limit:
-        raw_jobs = []
-        source_counts = {"db": 0, "external": 0, "db_ms": 0, "external_ms": 0}
     else:
         raw_jobs, source_counts = await fetch_jobs_hybrid_async(
             db,
@@ -705,7 +713,33 @@ def rerank_candidates(profile, candidates, final_limit=10, allow_llm=True):
     return explained_jobs, rerank_elapsed_ms
 
 
-def _result_cache_key(profile, country, fetch_limit, keyword_limit, similarity_limit, final_limit):
+def _jobs_payload_cache_token(jobs):
+    if jobs is None:
+        return None
+
+    serialized_jobs = json.dumps(jobs, sort_keys=True, default=str)
+    return hashlib.sha256(serialized_jobs.encode("utf-8")).hexdigest()
+
+
+def _job_store_cache_token(db):
+    if db is None:
+        return "no-db"
+
+    threshold = datetime.now(timezone.utc) - timedelta(days=JOB_TTL_DAYS)
+    try:
+        job_count, latest_created_at = db.query(
+            func.count(Job.id),
+            func.max(Job.created_at),
+        ).filter(Job.created_at >= threshold).one()
+    except Exception:
+        logger.exception("Could not compute job-store cache token.")
+        return "unavailable"
+
+    latest_token = latest_created_at.isoformat() if latest_created_at else None
+    return f"{int(job_count or 0)}:{latest_token}"
+
+
+def _result_cache_key(profile, country, fetch_limit, keyword_limit, similarity_limit, final_limit, jobs=None, db=None):
     payload = {
         "profile_text": build_profile_text(profile),
         "country": country,
@@ -713,6 +747,8 @@ def _result_cache_key(profile, country, fetch_limit, keyword_limit, similarity_l
         "keyword_limit": keyword_limit,
         "similarity_limit": similarity_limit,
         "final_limit": final_limit,
+        "job_input_mode": "payload" if jobs is not None else "store",
+        "job_input_token": _jobs_payload_cache_token(jobs) if jobs is not None else _job_store_cache_token(db),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return f"match_result:{digest}"
@@ -725,7 +761,16 @@ async def run_matching_pipeline(profile, db=None, jobs=None, country="fr", fetch
     final_limit = final_limit or FINAL_TOP_K
     pipeline_started_at = perf_counter()
     cache = get_cache()
-    cache_key = _result_cache_key(profile, country, fetch_limit, keyword_limit, similarity_limit, final_limit)
+    cache_key = _result_cache_key(
+        profile,
+        country,
+        fetch_limit,
+        keyword_limit,
+        similarity_limit,
+        final_limit,
+        jobs=jobs,
+        db=db,
+    )
     cached_response = cache.get_json(cache_key)
     if cached_response is not None:
         cached_response["cache_hit"] = True
