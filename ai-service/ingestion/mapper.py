@@ -25,3 +25,29 @@ def map_adzuna_job(job, allow_llm=True):
         "url": job.get("redirect_url"),
         "vector": None,
     }
+
+
+def map_serper_job(job, allow_llm=True):
+    title = job.get("title") or ""
+    description = job.get("description") or ""
+    location = job.get("location") or "Remote"
+    metadata = extract_job_metadata(title, description, allow_llm=allow_llm)
+
+    return {
+        "id": f"linkedin_{job['id']}",
+        "title": title,
+        "company": job.get("company", "Unknown Company"),
+        "location": location,
+        "remote": "remote" in location.lower() or "remote" in title.lower(),
+        "salary_min": None,
+        "salary_max": None,
+        "contract_type": None,
+        "description": description,
+        "skills_required": metadata["skills_required"],
+        "seniority": metadata["seniority"],
+        "industry": metadata["industry"],
+        "source": job.get("source", "linkedin_serper"),
+        "posted_at": job.get("posted_at"),
+        "url": job.get("url"),
+        "vector": None,
+    }

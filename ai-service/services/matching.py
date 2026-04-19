@@ -13,7 +13,8 @@ from database import SessionLocal
 from sqlalchemy import or_, and_, func
 from models.job import Job
 from ingestion.adzuna import fetch_adzuna_jobs
-from ingestion.mapper import map_adzuna_job
+from ingestion.linkedin_serper import fetch_linkedin_serper_jobs
+from ingestion.mapper import map_adzuna_job, map_serper_job
 from services.embedding import embed, embed_many
 from services.job_text import build_job_text, build_profile_text, normalize_list
 from services.job_parser import extract_job_metadata
@@ -31,7 +32,7 @@ REQUEST_TIMEOUT_MS = int(os.getenv("REQUEST_TIMEOUT_MS", "800"))
 PROFILE_EMBED_TTL_SECONDS = int(os.getenv("PROFILE_EMBED_TTL_SECONDS", "3600"))
 RESULT_CACHE_TTL_SECONDS = int(os.getenv("RESULT_CACHE_TTL_SECONDS", "600"))
 JOB_TTL_DAYS = int(os.getenv("JOB_TTL_DAYS", "14"))
-LIVE_JOB_EMBEDDING_ENABLED = os.getenv("LIVE_JOB_EMBEDDING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_JOB_EMBEDDING_ENABLED = os.getenv("LIVE_JOB_EMBEDDING_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 logger = logging.getLogger(__name__)
 _PERSIST_PENDING_IDS = set()
 _PERSIST_PENDING_LOCK = threading.Lock()
@@ -156,11 +157,20 @@ def save_jobs_to_db(db, jobs, allow_llm_metadata=True):
     if not to_insert:
         return
 
-    texts = [build_job_text(job) for job in to_insert]
-    embeddings = embed_many(texts)
+    # Optimize: Only embed jobs that don't already have a vector (e.g. from live embedding)
+    to_embed = [job for job in to_insert if not job.get("vector")]
+    if to_embed:
+        texts = [build_job_text(job) for job in to_embed]
+        embeddings = embed_many(texts)
+        embed_map = {job["id"]: emb for job, emb in zip(to_embed, embeddings)}
+        for job in to_insert:
+            if job["id"] in embed_map:
+                job["vector"] = embed_map[job["id"]]
 
-    for job_data, job_embedding in zip(to_insert, embeddings):
-        job_data["vector"] = job_embedding
+    for job_data in to_insert:
+        job_embedding = job_data.get("vector")
+        if not job_embedding:
+            continue
         db.add(
             Job(
                 id=job_data["id"],
@@ -207,17 +217,21 @@ def cleanup_stale_jobs(db):
 
 
 def fetch_jobs_from_db(db, query, limit=50):
-    if db is None:
+    if db is None or not query:
         return []
 
     threshold = datetime.now(timezone.utc) - timedelta(days=JOB_TTL_DAYS)
-    db_jobs_query = db.query(Job).filter(
+    # Refine: Prioritize title matches. We'll search both but the parallel fetch 
+    # ensures we don't get stuck with just loose DB matches.
+    db_jobs = db.query(Job).filter(
         and_(
-            or_(Job.title.ilike(f"%{query}%"), Job.description.ilike(f"%{query}%")),
+            or_(
+                Job.title.ilike(f"%{query}%"), 
+                and_(Job.description.ilike(f"%{query}%"), Job.title.ilike(f"%{query.split()[0]}%")) if query.split() else Job.description.ilike(f"%{query}%")
+            ),
             Job.created_at >= threshold
         )
-    )
-    db_jobs = db_jobs_query.limit(limit).all()
+    ).limit(limit).all()
     return [job_to_dict(job) for job in db_jobs]
 
 
@@ -234,56 +248,75 @@ def fetch_jobs_from_adzuna(query, country="fr", limit=50, location=None):
 
 
 async def fetch_jobs_hybrid_async(db, query, country="fr", limit=50, location=None):
-    if db is None:
-        external_started = perf_counter()
-        api_jobs = await asyncio.to_thread(fetch_jobs_from_adzuna, query, country, limit, location)
-        return api_jobs[:limit], {
-            "db": 0,
-            "external": len(api_jobs[:limit]),
-            "db_ms": 0,
-            "external_ms": int((perf_counter() - external_started) * 1000),
-        }
+    if not query:
+        return [], {"db": 0, "external": 0, "db_ms": 0, "external_ms": 0}
 
+    # Parallelize DB and External fetches to ensure freshness and performance
     db_started = perf_counter()
-    try:
-        db_jobs = await asyncio.to_thread(_fetch_jobs_from_db_with_fresh_session, query, limit)
-    except Exception:
+    external_started = perf_counter()
+    
+    db_task = asyncio.to_thread(_fetch_jobs_from_db_with_fresh_session, query, limit)
+    
+    # Breadth: Fetch from both Adzuna and LinkedIn (via Serper)
+    adzuna_limit = limit
+    linkedin_limit = max(10, limit // 2)
+    
+    api_task = asyncio.to_thread(fetch_jobs_from_adzuna, query, country, adzuna_limit, location)
+    linkedin_task = asyncio.to_thread(fetch_linkedin_serper_jobs, query, country, location, linkedin_limit)
+    
+    db_jobs_res, api_jobs_res, linkedin_jobs_res = await asyncio.gather(
+        db_task, api_task, linkedin_task, return_exceptions=True
+    )
+    
+    if isinstance(db_jobs_res, Exception):
         logger.exception("DB keyword fetch failed for query '%s'.", query)
         db_jobs = []
+    else:
+        db_jobs = db_jobs_res
+        
     db_elapsed = int((perf_counter() - db_started) * 1000)
-    results = list(db_jobs[:limit])
-    mapped_api_jobs = []
-    external_elapsed = 0
+    
+    # Process Adzuna results
+    if isinstance(api_jobs_res, Exception):
+        logger.exception("External Adzuna fetch failed for query '%s'.", query)
+        api_jobs = []
+    else:
+        api_jobs = api_jobs_res
 
-    if len(results) < limit:
-        remaining = limit - len(results)
-        external_started = perf_counter()
-        try:
-            api_jobs = await asyncio.to_thread(fetch_jobs_from_adzuna, query, country, remaining, location)
-        except Exception:
-            logger.exception("External Adzuna fetch failed for query '%s'.", query)
-            api_jobs = []
-        external_elapsed = int((perf_counter() - external_started) * 1000)
+    # Process LinkedIn results
+    if isinstance(linkedin_jobs_res, Exception):
+        logger.exception("External LinkedIn fetch failed for query '%s'.", query)
+        linkedin_jobs = []
+    else:
+        linkedin_jobs = linkedin_jobs_res
+        
+    external_elapsed = int((perf_counter() - external_started) * 1000)
 
-        for raw_job in api_jobs:
-            mapped = map_adzuna_job(raw_job, allow_llm=False) if raw_job.get("redirect_url") else raw_job
-            mapped_api_jobs.append(mapped)
+    # Map API jobs
+    mapped_external_jobs = []
+    for raw_job in api_jobs:
+        mapped = map_adzuna_job(raw_job, allow_llm=False) if raw_job.get("redirect_url") else raw_job
+        mapped_external_jobs.append(mapped)
 
-        seen_ids = {job.get("id") for job in results}
-        for mapped in mapped_api_jobs:
-            if mapped.get("id") not in seen_ids:
-                results.append(mapped)
-                seen_ids.add(mapped.get("id"))
-            if len(results) >= limit:
-                break
+    for raw_job in linkedin_jobs:
+        mapped = map_serper_job(raw_job, allow_llm=False)
+        mapped_external_jobs.append(mapped)
 
-        schedule_jobs_for_persistence(
-            mapped_api_jobs,
-            allow_llm_metadata=False,
-        )
+    # Merge results: Prioritize API jobs if we suspect the DB might be stale/polluted,
+    # but for now we just combine them and let the re-ranker handle it.
+    results = list(db_jobs)
+    seen_ids = {job.get("id") for job in results if job.get("id")}
+    
+    for mapped in mapped_external_jobs:
+        if mapped.get("id") not in seen_ids:
+            results.append(mapped)
+            seen_ids.add(mapped.get("id"))
+
     return results[:limit], {
         "db": len(db_jobs),
-        "external": len(mapped_api_jobs),
+        "external": len(mapped_external_jobs),
+        "adzuna": len(api_jobs),
+        "linkedin": len(linkedin_jobs),
         "db_ms": db_elapsed,
         "external_ms": external_elapsed,
     }
@@ -576,7 +609,7 @@ def semantic_rank_jobs(profile_embedding, jobs, limit=25, allow_live_embedding=F
     return ranked_jobs[:limit], stats
 
 
-async def retrieve_candidates(profile, db=None, jobs=None, country="fr", fetch_limit=50, keyword_limit=40, similarity_limit=25):
+async def retrieve_candidates(profile, db=None, jobs=None, country="fr", fetch_limit=50, keyword_limit=40, similarity_limit=25, background_tasks=None):
     retrieval_started_at = perf_counter()
     stage_timers = {}
     target_position = profile.get("target_position")
@@ -644,7 +677,16 @@ async def retrieve_candidates(profile, db=None, jobs=None, country="fr", fetch_l
     )
     stage_timers["semantic_total_ms"] = int((perf_counter() - semantic_started) * 1000)
 
+    # Schedule persistence of any new jobs found during retrieval
+    # normalized_jobs contains the fresh jobs from the API (Adzuna)
+    if normalized_jobs:
+        if background_tasks:
+            background_tasks.add_task(schedule_jobs_for_persistence, normalized_jobs, allow_llm_metadata=False)
+        else:
+            schedule_jobs_for_persistence(normalized_jobs, allow_llm_metadata=False)
+
     retrieval_elapsed_ms = int((perf_counter() - retrieval_started_at) * 1000)
+
     retrieval_breakdown = {
         "mode": "hybrid",
         "stages": {
@@ -754,7 +796,7 @@ def _result_cache_key(profile, country, fetch_limit, keyword_limit, similarity_l
     return f"match_result:{digest}"
 
 
-async def run_matching_pipeline(profile, db=None, jobs=None, country="fr", fetch_limit=None, keyword_limit=None, similarity_limit=None, final_limit=None):
+async def run_matching_pipeline(profile, db=None, jobs=None, country="fr", fetch_limit=None, keyword_limit=None, similarity_limit=None, final_limit=None, background_tasks=None):
     fetch_limit = fetch_limit or FETCH_LIMIT
     keyword_limit = keyword_limit or KEYWORD_TOP_K
     similarity_limit = similarity_limit or SIMILARITY_TOP_K
@@ -784,6 +826,7 @@ async def run_matching_pipeline(profile, db=None, jobs=None, country="fr", fetch
         fetch_limit=fetch_limit,
         keyword_limit=keyword_limit,
         similarity_limit=similarity_limit,
+        background_tasks=background_tasks,
     )
     elapsed_before_rerank_ms = int((perf_counter() - pipeline_started_at) * 1000)
     degraded_mode = elapsed_before_rerank_ms > REQUEST_TIMEOUT_MS

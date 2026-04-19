@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
 from deps import get_db
 
@@ -9,7 +9,7 @@ router = APIRouter()
 
 
 @router.post("/")
-async def match_jobs(payload: dict, db: Session = Depends(get_db)):
+async def match_jobs(payload: dict, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     profile = payload.get("user") or payload.get("profile")
     profile_id = payload.get("profile_id")
     if profile is None and profile_id:
@@ -32,6 +32,7 @@ async def match_jobs(payload: dict, db: Session = Depends(get_db)):
             keyword_limit=int(payload.get("keyword_limit", 40)),
             similarity_limit=int(payload.get("similarity_limit", 25)),
             final_limit=int(payload.get("final_limit", 10)),
+            background_tasks=background_tasks,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
