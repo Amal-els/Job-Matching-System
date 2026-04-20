@@ -51,3 +51,48 @@ def map_serper_job(job, allow_llm=True):
         "url": job.get("url"),
         "vector": None,
     }
+
+
+def map_indeed_job(job, allow_llm=True):
+    title = job.get("positionName") or job.get("title") or ""
+    if isinstance(title, dict):
+        title = title.get("text", str(title))
+    elif not isinstance(title, str):
+        title = str(title)
+
+    description = job.get("description") or ""
+    if isinstance(description, dict):
+        description = description.get("text", str(description))
+    elif not isinstance(description, str):
+        description = str(description)
+    
+    # Valig actor returns location in 'location', company in 'company'
+    location = job.get("location") or "Remote"
+    company = job.get("company") or "Unknown Company"
+    if isinstance(company, dict):
+        company = company.get("name", str(company))
+    if isinstance(location, dict):
+        location = location.get("text", str(location))
+    
+    metadata = extract_job_metadata(title, description, allow_llm=allow_llm)
+
+    job_id = job.get("id") or job.get("jobkey") or str(abs(hash(title + company)))
+
+    return {
+        "id": f"indeed_{job_id}",
+        "title": title,
+        "company": company,
+        "location": location,
+        "remote": "remote" in location.lower() or "remote" in title.lower(),
+        "salary_min": job.get("salaryMin") or job.get("salary_min"),
+        "salary_max": job.get("salaryMax") or job.get("salary_max"),
+        "contract_type": job.get("jobType") or job.get("contract_type"),
+        "description": description,
+        "skills_required": metadata["skills_required"],
+        "seniority": metadata["seniority"],
+        "industry": metadata["industry"],
+        "source": "indeed",
+        "posted_at": job.get("postedAt") or job.get("date"),
+        "url": job.get("url"),
+        "vector": None,
+    }

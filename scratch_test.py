@@ -17,8 +17,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def test():
-    query = "Product Manager"
-    location = "France"
+    query = "Software engineer"
+    location = "Tunisia"
     logger.info(f"Testing Serper fetch for '{query}' in '{location}'")
     jobs = fetch_linkedin_serper_jobs(query, location=location, limit=2)
     print(f"Total jobs found: {len(jobs)}")

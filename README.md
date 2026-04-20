@@ -33,7 +33,7 @@ sequenceDiagram
     participant R as Redis Cache
     participant D as PostgreSQL (pgvector)
     participant E as Embedding Service
-    participant X as Adzuna API
+    participant X as APIs (Adzuna, LinkedIn, Indeed)
 
     C->>A: POST /match {profile_id}
     A->>R: Lookup Cached Results
@@ -42,7 +42,8 @@ sequenceDiagram
     else Cache Miss
         A->>D: Load Profile + Precomputed Vector
         A->>D: ANN Search (pgvector)
-        A->>X: Concurrent Hybrid Fetch
+        A->>X: Concurrent Hybrid Fetch (Adzuna + LinkedIn + Indeed)
+        A->>A: Deduplication Engine (Hashing collisions dropped)
         A->>E: Batch Embed New Jobs
         A->>A: Stage 2: Keyword Ranking
         A->>A: Stage 3: Semantic Scoring
@@ -63,7 +64,8 @@ Understanding the codebase mapping:
 | **`ai-service/main.py`** | Application bootstrap, middleware, and router registration. |
 | **`routes/match.py`** | The `/match` endpoint logic (Pipeline Orchestrator). |
 | **`routes/profile.py`** | CRUD for User Profiles with automatic embedding on save. |
-| **`services/matching.py`** | The core logic. Manages stages from retrieval to ranking. |
+| **`services/matching.py`** | The core logic. Manages stages from retrieval, deduplication, to ranking. |
+| **`ingestion/indeed.py`** | Apify actor integration for seamless Indeed job scraping. |
 | **`services/embedding.py`** | Unified embedding client with remote service + local fallbacks. |
 | **`services/reranker.py`** | High-precision refinement using LLMs or weighted fallbacks. |
 | **`services/ann_index.py`** | Manages vector indexing and retrieval via `pgvector`. |
@@ -81,6 +83,8 @@ The engine doesn't just "guess". It uses a strictly weighted algorithm for its *
 - **Hard Skill Alignment (35%)**: Exact and fuzzy match within the normalized skill set.
 - **Seniority Proximity (10%)**: Distance-based scoring between experience levels.
 - **Industry Relevance (10%)**: Matching industry vertical tags.
+
+*Note: All scores are adjusted globally by a **Source Priority Multiplier** (e.g. Adzuna jobs receive full rank capability, while scraped sources like Indeed and LinkedIn receive minor trust penalties, resulting in high-quality reliable matches surfacing first).*
 
 ### Vector Search (Semantic Stage)
 We utilize `sentence-transformers/all-MiniLM-L6-v2` to map text to a **384-dimensional space**.
@@ -166,6 +170,7 @@ Triggers the full pipeline. Supports loading profiles by ID or raw payloads.
 - **Degraded Mode**: If the database or external APIs are slow and exceed `REQUEST_TIMEOUT_MS`, the system automatically skips LLM reranking and heavy semantic ranking, returning the best available keyword-matched results.
 - **Vector Backfilling**: Run `python backfill_job_embeddings.py` to process existing database rows that lack embeddings.
 - **Auto-Cleanup**: A background process removes stale job listings, ensuring the index stays dense and relevant.
+- **Deduplication Engine**: MD5 collision hashing is actively applied before jobs are parsed or embedded to remove spam or duplicate roles sourced across multiple data providers (Adzuna/Indeed/LinkedIn).
 
 ---
 
@@ -176,3 +181,20 @@ Triggers the full pipeline. Supports loading profiles by ID or raw payloads.
 ---
 
 > Built with ❤️ by the CareerMate AI Team.
+
+
+## Possible improvements:
+1. Instead of using regex for skills matching I can use Named Entity Recognition (NER) to extract skills from the job description and the candidate's profile.
+
+
+2. Feedback loop (super important)
+
+Real systems continuously learn from user behavior:
+
+Click → positive signal
+Apply → stronger signal
+Ignore → negative signal
+
+This creates a feedback loop:
+
+`User behavior → retrain model → better recommendations`

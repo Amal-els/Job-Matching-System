@@ -14,7 +14,8 @@ from sqlalchemy import or_, and_, func
 from models.job import Job
 from ingestion.adzuna import fetch_adzuna_jobs
 from ingestion.linkedin_serper import fetch_linkedin_serper_jobs
-from ingestion.mapper import map_adzuna_job, map_serper_job
+from ingestion.indeed import fetch_indeed_jobs
+from ingestion.mapper import map_adzuna_job, map_serper_job, map_indeed_job
 from services.embedding import embed, embed_many
 from services.job_text import build_job_text, build_profile_text, normalize_list
 from services.job_parser import extract_job_metadata
@@ -62,6 +63,27 @@ def _release_jobs_for_persistence(job_ids):
     with _PERSIST_PENDING_LOCK:
         for job_id in job_ids:
             _PERSIST_PENDING_IDS.discard(job_id)
+
+
+def job_fingerprint(job):
+    title = job.get("title") or ""
+    company = job.get("company") or ""
+    location = job.get("location") or ""
+    raw = title.lower().strip() + company.lower().strip() + location.lower().strip()
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def deduplicate_jobs(all_jobs):
+    seen = set()
+    clean_jobs = []
+    for job in all_jobs:
+        if not job: 
+            continue
+        fp = job_fingerprint(job)
+        if fp not in seen:
+            seen.add(fp)
+            clean_jobs.append(job)
+    return clean_jobs
 
 
 def persist_jobs_to_store(jobs, allow_llm_metadata=True, reserved_job_ids=None):
@@ -257,15 +279,17 @@ async def fetch_jobs_hybrid_async(db, query, country="fr", limit=50, location=No
     
     db_task = asyncio.to_thread(_fetch_jobs_from_db_with_fresh_session, query, limit)
     
-    # Breadth: Fetch from both Adzuna and LinkedIn (via Serper)
+    # Breadth: Fetch from Adzuna, LinkedIn, Indeed
     adzuna_limit = limit
     linkedin_limit = max(10, limit // 2)
+    indeed_limit = max(10, limit // 2)
     
     api_task = asyncio.to_thread(fetch_jobs_from_adzuna, query, country, adzuna_limit, location)
     linkedin_task = asyncio.to_thread(fetch_linkedin_serper_jobs, query, country, location, linkedin_limit)
+    indeed_task = asyncio.to_thread(fetch_indeed_jobs, query, location, indeed_limit)
     
-    db_jobs_res, api_jobs_res, linkedin_jobs_res = await asyncio.gather(
-        db_task, api_task, linkedin_task, return_exceptions=True
+    db_jobs_res, api_jobs_res, linkedin_jobs_res, indeed_jobs_res = await asyncio.gather(
+        db_task, api_task, linkedin_task, indeed_task, return_exceptions=True
     )
     
     if isinstance(db_jobs_res, Exception):
@@ -290,6 +314,13 @@ async def fetch_jobs_hybrid_async(db, query, country="fr", limit=50, location=No
     else:
         linkedin_jobs = linkedin_jobs_res
         
+    # Process Indeed results
+    if isinstance(indeed_jobs_res, Exception):
+        logger.exception("External Indeed fetch failed for query '%s'.", query)
+        indeed_jobs = []
+    else:
+        indeed_jobs = indeed_jobs_res
+        
     external_elapsed = int((perf_counter() - external_started) * 1000)
 
     # Map API jobs
@@ -302,21 +333,20 @@ async def fetch_jobs_hybrid_async(db, query, country="fr", limit=50, location=No
         mapped = map_serper_job(raw_job, allow_llm=False)
         mapped_external_jobs.append(mapped)
 
-    # Merge results: Prioritize API jobs if we suspect the DB might be stale/polluted,
-    # but for now we just combine them and let the re-ranker handle it.
-    results = list(db_jobs)
-    seen_ids = {job.get("id") for job in results if job.get("id")}
-    
-    for mapped in mapped_external_jobs:
-        if mapped.get("id") not in seen_ids:
-            results.append(mapped)
-            seen_ids.add(mapped.get("id"))
+    for raw_job in indeed_jobs:
+        mapped = map_indeed_job(raw_job, allow_llm=False)
+        mapped_external_jobs.append(mapped)
+
+    # Merge results and deduplicate
+    combined = list(db_jobs) + mapped_external_jobs
+    results = deduplicate_jobs(combined)
 
     return results[:limit], {
         "db": len(db_jobs),
         "external": len(mapped_external_jobs),
         "adzuna": len(api_jobs),
         "linkedin": len(linkedin_jobs),
+        "indeed": len(indeed_jobs),
         "db_ms": db_elapsed,
         "external_ms": external_elapsed,
     }
@@ -496,12 +526,25 @@ def keyword_filter_jobs(profile, jobs, limit=40):
         seniority_score = compute_seniority_score(profile_level, job.get("seniority"))
         industry_score = compute_industry_score(profile_industries, job.get("industry"))
         matched_skills = sorted(profile_skills & normalize_skill_set(job.get("skills_required")))
-        keyword_score = weighted_average([
+        
+        # Source Weighting
+        source = str(job.get("source") or "").lower()
+        source_multiplier = 1.0  # default
+        if "adzuna" in source:
+            source_multiplier = 1.0
+        elif "indeed" in source:
+            source_multiplier = 0.85
+        elif "linkedin" in source:
+            source_multiplier = 0.7
+            
+        base_keyword_score = weighted_average([
             (position_score, 0.45),
             (skill_score, 0.35),
             (seniority_score, 0.10),
             (industry_score, 0.10),
         ])
+        
+        keyword_score = base_keyword_score * source_multiplier
 
         filtered_jobs.append({
             **job,
