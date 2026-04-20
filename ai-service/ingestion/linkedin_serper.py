@@ -12,7 +12,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 logger = logging.getLogger(__name__)
 
-def fetch_linkedin_serper_jobs(query: str, country: str = "fr", location: str = None, limit: int = 10) -> List[Dict[str, Any]]:
+def fetch_linkedin_serper_jobs(query: str, country: str = "fr", location: str = None, limit: int = 10, date_posted: str = "past_week") -> List[Dict[str, Any]]:
     """
     Search for LinkedIn jobs via Google using Serper API.
     """
@@ -25,11 +25,26 @@ def fetch_linkedin_serper_jobs(query: str, country: str = "fr", location: str = 
         search_query += f' "{location}"'
 
     url = "https://google.serper.dev/search"
-    payload = json.dumps({
+    
+    tbs_mapping = {
+        "past_24h": "qdr:d",
+        "past_week": "qdr:w",
+        "past_month": "qdr:m",
+        "any": None
+    }
+    
+    payload_dict = {
         "q": search_query,
         "num": limit,
         "gl": country
-    })
+    }
+    
+    tbs_val = tbs_mapping.get(date_posted)
+    if tbs_val:
+        payload_dict["tbs"] = tbs_val
+        
+    payload = json.dumps(payload_dict)
+    
     headers = {
         'X-API-KEY': SERPER_API_KEY,
         'Content-Type': 'application/json'
